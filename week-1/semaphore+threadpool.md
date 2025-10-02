@@ -513,47 +513,551 @@ asyncio.run(main())
 
 ---
 
-## Comparison: Semaphore vs ThreadPoolExecutor
+## 🎯 CRITICAL DECISION: Semaphore vs ThreadPoolExecutor
 
+This is the #1 confusion point! Here's the definitive guide:
+
+### Understanding I/O-bound vs CPU-bound
+
+**I/O-bound (Input/Output) = WAITING for external resources**
+- Your code sends a request, then **waits** for a response
+- During the wait, your **CPU is IDLE** (doing nothing)
+- Examples: API calls, database queries, file operations, network requests
+- **This is 95% of your work if you're doing LLM/API/database tasks!**
+
+**CPU-bound = ACTIVELY COMPUTING**
+- Your code is **actively calculating** something
+- Your **CPU is BUSY** working (not waiting)
+- Examples: Image processing, video encoding, complex math, data parsing
+- **You probably won't encounter this much in typical LLM/API work**
+
+---
+
+### The Golden Rule (For Your Daily Work)
+
+**Step 1:** Most of your tasks are I/O-bound (API calls, database queries)
+
+**Step 2:** Check if the SDK supports async:
+```
+Does the SDK/library have `async` or `await` in the docs?
+│
+├─ YES → ✅ Use asyncio + Semaphore
+│   Examples: OpenAI (AsyncOpenAI), Anthropic (AsyncAnthropic),
+│            httpx, aiofiles, asyncpg, Braintrust (await Eval)
+│
+└─ NO → ✅ Use ThreadPoolExecutor
+    Examples: requests library, old Cohere SDK, sync database drivers
+```
+
+**Step 3:** CPU-bound? (Rare for your work)
+```
+Are you doing heavy computation (not API calls)?
+│
+└─ YES → Use multiprocessing.Pool
+    Examples: Image processing, video encoding, complex algorithms
+
+    ⚠️  You'll RARELY need this for LLM/API/database work!
+```
+
+---
+
+### Real-World Reality Check
+
+**For typical LLM/RAG/API work, you'll only use:**
+1. **asyncio + Semaphore** (90% of the time) - OpenAI, Anthropic, modern APIs
+2. **ThreadPoolExecutor** (10% of the time) - Old sync libraries, simple scripts
+
+**You'll almost NEVER use:**
+3. **multiprocessing.Pool** - Unless you're processing images, videos, or heavy computation
+
+**The simplified decision for your daily work:**
+```
+I'm making API calls or querying databases...
+│
+└─ Check the docs: Does it have `await` or `AsyncClient`?
+    ├─ YES → asyncio + Semaphore ✅
+    └─ NO → ThreadPoolExecutor ✅
+```
+
+---
+
+### 💡 How They Work Differently (The Key Insight!)
+
+**The Core Problem: You want to run 100 API calls efficiently**
+
+#### **Async (Non-blocking) - The Problem & Solution:**
+
+**What happens WITHOUT Semaphore:**
 ```python
-# ❌ ThreadPoolExecutor (for API calls)
-from concurrent.futures import ThreadPoolExecutor
+# ❌ All 100 async functions fire AT ONCE (no automatic queue!)
+async def call_api(i):
+    response = await api.get(f"/item/{i}")
+    return response
 
-def api_call(i):
-    return requests.get(f"https://api.example.com/{i}")
+# All 100 START IMMEDIATELY - no queuing!
+tasks = [call_api(i) for i in range(100)]
+await asyncio.gather(*tasks)
+# ← 100 requests hit API simultaneously! Rate limit error! ❌
+```
+
+- **Async = non-blocking**, so all 100 calls start **immediately**
+- No automatic queuing - they all fire at once
+- Result: API overload, rate limit errors
+
+**What happens WITH Semaphore:**
+```python
+# ✅ Semaphore limits to 10 at a time
+sem = Semaphore(10)
+
+async def call_api(i, sem):
+    async with sem:  # ← GATE: Only 10 can be here at once
+        response = await api.get(f"/item/{i}")
+    return response
+
+# All 100 START, but only 10 pass through semaphore gate
+tasks = [call_api(i, sem) for i in range(100)]
+await asyncio.gather(*tasks)  # ✅ Only 10 concurrent calls at a time
+```
+
+- All 100 coroutines start immediately
+- Semaphore acts as a **gate** - only 10 can execute API call
+- Other 90 **wait** at `async with sem:` line
+- Result: Controlled concurrency, no rate limit errors
+
+---
+
+#### **Sync (Blocking) - The Problem & Solution:**
+
+**What happens WITHOUT ThreadPoolExecutor:**
+```python
+# ❌ All 100 sync functions run ONE AT A TIME (sequential queue!)
+def call_api_sync(i):
+    response = api.get(f"/item/{i}")  # Blocking!
+    return response
+
+results = []
+for i in range(100):
+    results.append(call_api_sync(i))  # ← One finishes, then next starts
+# First → Second → Third → ... → 100th (very slow!)
+```
+
+- **Sync = blocking**, so functions run **one at a time** (queued)
+- First finishes → Second starts → Third starts... (sequential)
+- No concurrency at all
+- Result: 100 calls take 100× longer
+
+**What happens WITH ThreadPoolExecutor:**
+```python
+# ✅ ThreadPoolExecutor creates 10 parallel threads
+def call_api_sync(i):
+    response = api.get(f"/item/{i}")  # Blocking
+    return response
 
 with ThreadPoolExecutor(max_workers=10) as executor:
-    results = list(executor.map(api_call, range(100)))
-
-# Problems:
-# - Each thread uses ~8MB memory
-# - Limited to ~10-20 workers (memory overhead)
-# - Slower context switching
-# - Python GIL contention
+    results = list(executor.map(call_api_sync, range(100)))
+# ✅ 10 calls at a time (10 threads working in parallel)
 ```
+
+- Creates 10 separate threads
+- Each thread handles sync functions sequentially
+- 10 threads = 10 functions running at same time
+- Result: 10× faster than sequential
+
+---
+
+#### **Both Achieve "10 at a Time" - Different Mechanisms:**
+
+| Aspect | Async + Semaphore | ThreadPoolExecutor |
+|--------|-------------------|-------------------|
+| **Without control** | All 100 start at once ❌ | All 100 queue one-by-one ❌ |
+| **With control** | Semaphore gates 10 at a time ✅ | 10 threads run 10 at a time ✅ |
+| **How it works** | 100 coroutines exist, semaphore limits access | 10 threads exist, naturally limited |
+| **Memory** | 1KB × 100 = 100KB | 8MB × 10 = 80MB |
+| **Max concurrent** | 100-1000+ | 10-50 |
+
+---
+
+#### **Visual Timeline: 100 Tasks, Limit to 10 Concurrent**
+
+**Async + Semaphore:**
+```
+Time 0s:  All 100 coroutines START immediately
+          ↓
+          Coroutines 1-10:  [Inside gate, calling API] ← 10 active
+          Coroutines 11-100: [Waiting at gate] ← 90 waiting
+
+Time 2s:  Coroutine 1 done → Coroutine 11 enters gate
+          Coroutines 2-10, 11: [Inside gate] ← 10 active
+          Coroutines 12-100: [Waiting] ← 89 waiting
+
+...continues until all 100 done
+```
+
+**ThreadPoolExecutor:**
+```
+Time 0s:  Only 10 threads exist (not 100!)
+          ↓
+          Thread 1:  [Task 1] → [Task 11] → [Task 21] → ...
+          Thread 2:  [Task 2] → [Task 12] → [Task 22] → ...
+          ...
+          Thread 10: [Task 10] → [Task 20] → [Task 30] → ...
+
+Each thread processes tasks sequentially
+Only 10 tasks active at any time
+```
+
+---
+
+#### **Why Asyncio + Semaphore is Better for I/O:**
+- **1KB per task** (lightweight coroutines) vs **8MB per thread** (heavy)
+- Can handle **100+ concurrent** easily vs **10-20 threads** max
+- **Faster switching** (event loop) vs **slower** (OS thread context switching)
+- **No GIL contention** (one thread) vs **GIL switching** (multiple threads)
+
+---
+
+#### **When ThreadPoolExecutor Still Works:**
+- Sync SDK with I/O operations (requests, old libraries)
+- I/O operations **release the Python GIL**, so threads can wait concurrently
+- Not as efficient as asyncio, but works fine for smaller scale (10-20 concurrent)
+
+---
+
+### 🎯 The Simple Mental Model:
+
+**Async without Semaphore:**
+- 🏃💨💨💨 All 100 people RUN to the door at once → **STAMPEDE!** ❌
+
+**Async with Semaphore:**
+- 🏃💨💨💨 All 100 people START running, but door only lets 10 through at a time ✅
+- (100 people running, 10 inside, 90 waiting at door)
+
+**Sync without ThreadPoolExecutor:**
+- 🚶...🚶...🚶 People line up single-file → one at a time through door ❌
+- (Very slow, 100 in a sequential queue)
+
+**Sync with ThreadPoolExecutor:**
+- 👥👥👥 Create 10 doors (threads) → 10 people through at once ✅
+- (10 threads, each processing tasks sequentially)
+
+---
+
+### Decision Tree with Code Examples
+
+#### Scenario 1: Async SDK Available (BEST - Use Asyncio + Semaphore)
 
 ```python
-# ✅ Async + Semaphore (for API calls)
-import asyncio
+# ✅ OpenAI SDK supports async
+from openai import AsyncOpenAI
 from asyncio import Semaphore
-import httpx
 
-async def api_call(i, sem):
+client = AsyncOpenAI()
+
+async def call_openai(prompt, sem):
     async with sem:
-        async with httpx.AsyncClient() as client:
-            return await client.get(f"https://api.example.com/{i}")
+        response = await client.chat.completions.create(...)  # ← `await` works!
+        return response.choices[0].message.content
 
 async def main():
-    sem = Semaphore(50)  # Can handle 50+ concurrent!
-    coros = [api_call(i, sem) for i in range(100)]
+    sem = Semaphore(10)
+    coros = [call_openai(p, sem) for p in prompts]
+    results = await asyncio.gather(*coros)
+
+# Why this is BEST:
+# ✅ Lightweight (1KB per coroutine vs 8MB per thread)
+# ✅ Can handle 100+ concurrent operations
+# ✅ Fast context switching (event loop)
+# ✅ No Python GIL issues
+# ✅ Built-in rate limiting with semaphore
+```
+
+#### Scenario 2: No Async SDK (Use ThreadPoolExecutor)
+
+```python
+# ❌ Old Cohere SDK (no async support)
+import cohere
+from concurrent.futures import ThreadPoolExecutor
+
+co = cohere.Client(api_key)
+
+def call_cohere(prompt):
+    response = co.generate(prompt=prompt)  # ← No `await`! Blocking!
+    return response.generations[0].text
+
+# ✅ Use ThreadPoolExecutor since SDK is sync
+with ThreadPoolExecutor(max_workers=10) as executor:
+    results = list(executor.map(call_cohere, prompts))
+
+# Why ThreadPoolExecutor here:
+# ✅ Works with sync I/O operations
+# ✅ Each thread can wait independently (I/O releases GIL)
+# ⚠️  Limited to ~10-20 threads (memory overhead)
+# ⚠️  8MB per thread (can't scale to 100+ like async)
+```
+
+#### Scenario 3: CPU-Bound Work (Use multiprocessing)
+
+```python
+# CPU-bound: Image processing
+from multiprocessing import Pool
+import numpy as np
+
+def process_image(image_path):
+    img = load_image(image_path)
+    # Heavy computation: resize, filter, transform
+    processed = apply_filters(img)  # ← CPU working hard!
+    return processed
+
+# ✅ Use multiprocessing for CPU work
+with Pool(processes=8) as pool:  # Use all CPU cores
+    results = pool.map(process_image, image_paths)
+
+# Why multiprocessing:
+# ✅ True parallelism (separate Python processes)
+# ✅ No GIL limitation (each process has own GIL)
+# ✅ Utilizes all CPU cores
+# ❌ High memory overhead (full Python interpreter per process)
+# ❌ NOT for I/O-bound tasks
+```
+
+---
+
+### When Each Approach Fails
+
+#### ❌ Using Asyncio with Sync SDK (DOESN'T WORK!)
+
+```python
+# ❌ WRONG - Trying to use async with sync SDK
+import asyncio
+from asyncio import Semaphore
+
+def sync_api_call(prompt):  # ← Sync function, no `await`
+    return sync_client.generate(prompt)
+
+async def worker(prompt, sem):
+    async with sem:
+        result = sync_api_call(prompt)  # ← BLOCKS event loop!
+        # Other coroutines CAN'T run while this executes
+        return result
+
+# This gives you NO benefit! All tasks run one-at-a-time.
+# The event loop is blocked during sync_api_call()
+```
+
+#### ❌ Using ThreadPoolExecutor for CPU Work (SLOW!)
+
+```python
+# ❌ WRONG - Threads for CPU-bound work
+from concurrent.futures import ThreadPoolExecutor
+
+def calculate_heavy(data):
+    # CPU-intensive calculation
+    result = complex_math(data)  # ← CPU actively computing
+    return result
+
+# ❌ Threads won't help here due to Python GIL
+with ThreadPoolExecutor(max_workers=8) as executor:
+    results = list(executor.map(calculate_heavy, dataset))
+
+# Why this is SLOW:
+# - Python GIL allows only ONE thread to run Python code at a time
+# - All 8 threads compete for the GIL
+# - No true parallelism for CPU work
+# - Use multiprocessing.Pool instead!
+```
+
+---
+
+### The Memory & Scalability Comparison
+
+| Approach | Memory per Task | Max Concurrent | Use Case |
+|----------|----------------|----------------|----------|
+| **asyncio + Semaphore** | ~1 KB | 100-1000+ | I/O-bound with async SDK |
+| **ThreadPoolExecutor** | ~8 MB | 10-50 | I/O-bound with sync SDK |
+| **multiprocessing.Pool** | ~50 MB | 1-16 (CPU cores) | CPU-bound work |
+
+**Example:**
+- **100 API calls with asyncio**: ~100 KB memory ✅
+- **100 API calls with threads**: ~800 MB memory ❌
+- **100 CPU tasks with multiprocessing**: ~5 GB memory (impractical!)
+
+---
+
+### Real-World Decision Examples
+
+#### Example 1: OpenAI API Calls
+```python
+# Task: Generate 500 completions
+# I/O-bound? YES (waiting for API response)
+# Async SDK? YES (AsyncOpenAI exists)
+# Decision: ✅ asyncio + Semaphore
+
+from openai import AsyncOpenAI
+from asyncio import Semaphore
+
+async def generate(prompt, sem):
+    async with sem:
+        return await client.chat.completions.create(...)
+
+# Can handle 50+ concurrent easily
+```
+
+#### Example 2: Web Scraping (Sync Library)
+```python
+# Task: Scrape 200 websites
+# I/O-bound? YES (waiting for HTTP response)
+# Async SDK? NO (using requests library - sync only)
+# Decision: ✅ ThreadPoolExecutor
+
+import requests
+from concurrent.futures import ThreadPoolExecutor
+
+def scrape(url):
+    return requests.get(url).text  # Sync, but I/O releases GIL
+
+with ThreadPoolExecutor(max_workers=20) as executor:
+    results = executor.map(scrape, urls)
+```
+
+#### Example 3: Image Processing
+```python
+# Task: Resize 1000 images
+# I/O-bound? NO (CPU computing pixel transformations)
+# Decision: ✅ multiprocessing.Pool
+
+from multiprocessing import Pool
+from PIL import Image
+
+def resize(image_path):
+    img = Image.open(image_path)
+    return img.resize((800, 600))  # CPU-intensive
+
+with Pool(processes=8) as pool:  # Use all CPU cores
+    pool.map(resize, image_paths)
+```
+
+#### Example 4: Database Queries (Async Support)
+```python
+# Task: Query 300 records from PostgreSQL
+# I/O-bound? YES (waiting for database)
+# Async SDK? YES (asyncpg library)
+# Decision: ✅ asyncio + Semaphore
+
+import asyncpg
+from asyncio import Semaphore
+
+async def query_db(user_id, sem):
+    async with sem:
+        conn = await asyncpg.connect(...)
+        return await conn.fetch("SELECT * FROM users WHERE id=$1", user_id)
+
+# Efficient concurrent DB queries
+```
+
+#### Example 5: LanceDB Local Search (Sync + CPU-bound)
+```python
+# Task: Search 500 queries in local LanceDB
+# I/O-bound? NO (local disk + vector similarity computation)
+# CPU-bound? YES (vector math: dot products, sorting)
+# Async SDK? NO (LanceDB Python is sync)
+# Decision: ✅ multiprocessing.Pool
+
+from multiprocessing import Pool
+
+def search_db(query):
+    results = table.search(query).limit(10)  # CPU: vector similarity
+    return results.to_list()
+
+with Pool(processes=8) as pool:
+    all_results = pool.map(search_db, queries)
+```
+
+---
+
+### Workaround: Async with Sync SDK (Advanced)
+
+If you MUST use asyncio with a sync SDK, wrap it in a thread pool:
+
+```python
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+# Sync SDK
+def sync_api_call(prompt):
+    return sync_client.generate(prompt)
+
+# Wrap in executor
+async def async_wrapper(prompt, sem):
+    async with sem:
+        loop = asyncio.get_event_loop()
+        # Run sync function in thread pool
+        result = await loop.run_in_executor(None, sync_api_call, prompt)
+        return result
+
+async def main():
+    sem = Semaphore(10)
+    coros = [async_wrapper(p, sem) for p in prompts]
     return await asyncio.gather(*coros)
 
-# Benefits:
-# - Each coroutine uses ~1KB memory
-# - Can handle 100+ concurrent easily
-# - Faster event loop switching
-# - No GIL issues
+# This works, but ThreadPoolExecutor is simpler for this case
 ```
+
+---
+
+### 🎯 The Simple Decision Flow
+
+```
+START: What am I doing?
+│
+├─ Making API calls / Database queries / Network requests
+│   └─ Does the library have `async` or `await` in the docs?
+│       ├─ YES → asyncio + Semaphore ✅
+│       └─ NO → ThreadPoolExecutor ✅
+│
+├─ Heavy computation / Image processing / Data transformation
+│   └─ multiprocessing.Pool ✅
+│
+└─ Mixed (API call + computation)
+    └─ Use asyncio for I/O, then process results with multiprocessing
+```
+
+---
+
+### Summary Table
+
+| Your Task | Question to Ask | Answer | Use This |
+|-----------|----------------|--------|----------|
+| OpenAI API calls | Has async SDK? | ✅ Yes | asyncio + Semaphore |
+| Old Cohere API | Has async SDK? | ❌ No | ThreadPoolExecutor |
+| Web scraping (requests) | Has async SDK? | ❌ No | ThreadPoolExecutor |
+| Web scraping (httpx) | Has async SDK? | ✅ Yes | asyncio + Semaphore |
+| LanceDB local search | I/O or CPU? | CPU (vector math) | multiprocessing.Pool |
+| LanceDB cloud search | Has async SDK? | Check docs first | Depends on SDK |
+| Image resizing | I/O or CPU? | CPU | multiprocessing.Pool |
+| File reading | Has async SDK? | ✅ Yes (aiofiles) | asyncio + Semaphore |
+| Braintrust Eval | Has async SDK? | ✅ Yes (await Eval) | asyncio + Semaphore |
+
+---
+
+### Key Takeaways
+
+1. **ALWAYS check if the SDK has async support FIRST** (look for `await`, `async def`, `AsyncClient` in docs)
+
+2. **I/O-bound + async SDK = asyncio + Semaphore** (best performance, lowest memory)
+
+3. **I/O-bound + sync SDK = ThreadPoolExecutor** (threads release GIL during I/O wait)
+
+4. **CPU-bound = multiprocessing.Pool** (true parallelism, uses all cores)
+
+5. **When in doubt:**
+   - Try asyncio first if SDK has async
+   - Fall back to ThreadPoolExecutor if SDK is sync but I/O-bound
+   - Use multiprocessing only for heavy computation
+
+6. **Python GIL rule:**
+   - Threads DON'T help CPU work (GIL blocks parallelism)
+   - Threads DO help I/O work (GIL released during I/O wait)
+   - Async BEST for I/O if SDK supports it (no thread overhead)
 
 ---
 

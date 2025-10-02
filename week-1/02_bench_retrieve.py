@@ -29,6 +29,7 @@ from lancedb.rerankers import CohereReranker, Reranker
 from lancedb.table import Table
 
 
+# Function to get or create a LanceDB table based on the embedding model
 def get_or_create_lancedb_table(db: Table, table_name: str, embedding_model: str):
     if table_name in db.table_names():
         print(f"Table {table_name} already exists")
